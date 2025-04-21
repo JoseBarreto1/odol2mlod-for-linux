@@ -1,11 +1,8 @@
-cmake_minimum_required(VERSION 3.27)
-project (OdolToMlod)
+cmake_minimum_required(VERSION 3.10)
+project(odol2mlod)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17 -Wall")
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_definitions(-ggdb)
-
-add_executable(odol2mlod
-	main.cpp
-)
-
+add_executable(odol2mlod main.cpp)
+target_link_libraries(odol2mlod stdc++fs)

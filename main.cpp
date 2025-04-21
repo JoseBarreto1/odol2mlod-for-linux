@@ -1,4 +1,4 @@
-#define SYSTEM_WINDOWS
+#define _POSIX_C_SOURCE 200809L // Para strdup e outras funções POSIX
 
 #include <cstdint>
 #include <vector>
@@ -9,30 +9,38 @@
 #include <string>
 #include <algorithm>
 #include <unordered_map>
+#include <filesystem>
+#include <chrono>
+#include <ctime>
+#include <sys/stat.h>
+#include <cstring>
+#include <cstdlib>
+
 #include "std/zip.hpp"
 #include "std/span.hpp"
 #include "std/file.hpp"
 #include "math/math2d.hpp"
 #include "math/math3d.hpp"
-#include <float.h> 
+#include <float.h>
 
-#ifdef SYSTEM_WINDOWS
-	#include <windows.h>
-#endif
+namespace fs = std::filesystem;
+
+std::string FormatFileInfo(const fs::directory_entry& entry);
+int ScanDirectory(const std::string& path, int &options);
 
 enum PROGRAM_OPTIONS {
-	OPTION_NONE                   = 0x0,
-	OPTION_INFO                   = 0x1,
-	OPTION_INFO_FULL              = 0x2,
-	OPTION_RECURSIVE              = 0x4,
-	OPTION_SINGLELOG              = 0x8,
-	OPTION_TRUNCATE               = 0x10,
-	OPTION_MERGE_POINTS           = 0x20,
-	OPTION_MERGE_POINTS_SELECTIVE = 0x40,
-	OPTION_ONLY_USER_VALUE        = 0x80,
-	OPTION_TEXTURE_LIST           = 0x100,
-	OPTION_TEXTURE_LIST_LODS      = 0x200,
-	OPTION_TEXTURE_LIST_SINGLE    = 0x400,
+    OPTION_NONE                   = 0x0,
+    OPTION_INFO                   = 0x1,
+    OPTION_INFO_FULL              = 0x2,
+    OPTION_RECURSIVE              = 0x4,
+    OPTION_SINGLELOG              = 0x8,
+    OPTION_TRUNCATE               = 0x10,
+    OPTION_MERGE_POINTS           = 0x20,
+    OPTION_MERGE_POINTS_SELECTIVE = 0x40,
+    OPTION_ONLY_USER_VALUE        = 0x80,
+    OPTION_TEXTURE_LIST           = 0x100,
+    OPTION_TEXTURE_LIST_LODS      = 0x200,
+    OPTION_TEXTURE_LIST_SINGLE    = 0x400,
 };
 
 constexpr static uint32_t signature_mlod = 0x444f4c4d;
@@ -41,13 +49,13 @@ constexpr static uint32_t signature_sp3x = 0x58335053;
 constexpr static uint32_t signature_odol = 0x4c4f444f;
 
 struct GLOBAL_VARIABLES {
-	int files_ok;
-	int files_total;
-	std::vector<std::string> files_to_skip;
-	std::vector<std::string> texture_list;
+    int files_ok;
+    int files_total;
+    std::vector<std::string> files_to_skip;
+    std::vector<std::string> texture_list;
 } global = {
-	0,
-	0
+    0,
+    0
 };
 
 constexpr bool starts_with(std::string_view sv, std::string_view prefix) noexcept {
@@ -59,35 +67,57 @@ bool Decode(fp::span<std::byte> out, fp::file& file) {
 	uint32_t sum = 0u;
 	uint32_t flags = 0u;
 	size_t size = out.size();
+
+	std::cerr << "[DEBUG] Iniciando Decode. Tamanho do buffer de saída: " << size << "\n";
+
 	while (size != 0) {
 		flags >>= 1;
 		if ((flags & 0x100) == 0) {
 			flags = file.getc() | 0xff00;
 			if (file.error() || file.eof()) {
+				std::cerr << "[ERROR] Falha ao ler flags. Erro ou EOF encontrado.\n";
 				return false;
 			}
+			std::cerr << "[DEBUG] Novos flags lidos: 0x" << std::hex << flags << std::dec << "\n";
 		}
+
 		if (flags & 0x01u) {
-			// raw data
 			const auto data = static_cast<uint8_t>(file.getc());
 			if (file.error() || file.eof()) {
+				std::cerr << "[ERROR] Falha ao ler byte raw.\n";
+				return false;
+			}
+			if (outPos >= static_cast<int32_t>(out.size())) {
+				std::cerr << "[ERROR] Escrita fora dos limites do buffer (raw).\n";
 				return false;
 			}
 			sum += data;
 			out[outPos] = static_cast<std::byte>(data);
 			++outPos;
 			--size;
+
+			std::cerr << "[DEBUG] RAW Byte: 0x" << std::hex << static_cast<int>(data) << std::dec
+			          << " → posição " << outPos - 1 << "\n";
+
 		} else {
 			int32_t rpos = static_cast<int32_t>(file.getc());
 			int32_t rlen = static_cast<int32_t>(file.getc());
 			if (file.error() || file.eof()) {
+				std::cerr << "[ERROR] Falha ao ler referência (rpos/rlen).\n";
 				return false;
 			}
+
 			rpos |= (rlen & 0xf0) << 4;
 			rlen &= 0x0f;
 			rlen += 3;
+
+			std::cerr << "[DEBUG] Referência → rpos: " << rpos << ", rlen: " << rlen << "\n";
+
 			while (rpos > outPos && rlen != 0u) {
-				// special case space fill
+				if (outPos >= static_cast<int32_t>(out.size())) {
+					std::cerr << "[ERROR] Overflow no buffer (espaço).\n";
+					return false;
+				}
 				sum += 0x20;
 				out[outPos] = static_cast<std::byte>(0x20);
 				++outPos;
@@ -97,29 +127,45 @@ bool Decode(fp::span<std::byte> out, fp::file& file) {
 				}
 				--rlen;
 			}
+
 			rpos = outPos - rpos;
+			if (rpos < 0 || rpos >= static_cast<int32_t>(out.size())) {
+				std::cerr << "[ERROR] Referência inválida no buffer (rpos calculado = " << rpos << ")\n";
+				return false;
+			}
+
 			auto from = &out[rpos];
 			auto to = &out[outPos];
 			outPos += rlen;
+
 			for (; rlen > 0; --rlen) {
+				if (size == 0u || to >= out.end()) {
+					std::cerr << "[WARN] Buffer final alcançado durante cópia.\n";
+					break;
+				}
 				const auto data = *from;
 				++from;
 				sum += std::to_integer<uint8_t>(data);
 				*to = data;
 				++to;
 				--size;
-				if (size == 0u) {
-					break;
-				}
 			}
 		}
 	}
+
 	uint32_t checkSum;
 	if (file.read(fp::to_writable_bytes(checkSum)) != sizeof(checkSum)) {
+		std::cerr << "[ERROR] Falha ao ler checksum do arquivo.\n";
 		return false;
+	}
+
+	std::cerr << "[DEBUG] Checksum esperado: " << checkSum << ", calculado: " << sum << "\n";
+	if (checkSum != sum) {
+		std::cerr << "[ERROR] Checksum não confere!\n";
 	}
 	return (checkSum == sum);
 }
+
 template <class T>
 constexpr inline bool has_load(
 	int, std::enable_if_t<sizeof(std::declval<T&>().Load(std::declval<fp::file&>()), bool())>* = 0) {
@@ -206,17 +252,43 @@ void ReadArray(std::vector<T>& array, fp::file& file, Args&&... args) {
 template <class T>
 void ReadCompressedArray(std::vector<T>& array, fp::file& file) {
 	uint32_t size = 0;
-	file.read(fp::to_writable_bytes(size));
-	array.resize(size);
-	if (array.size() * sizeof(T) < 1024) {
-		// no compression for small stuff
-		file.read(fp::as_writable_bytes(fp::span(array)));
-	} else {
-		if (!Decode(fp::as_writable_bytes(fp::span(array)), file)) {
-			std::cout << "Failed to decode data" << std::endl;
-			exit(1);
+    if (!file.read(fp::to_writable_bytes(size))) {
+        std::cerr << "[ERROR] Failed to read array size\n";
+        exit(1);
+    }
+
+    const uint32_t MAX_ALLOWED_SIZE = 100 * 1024 * 1024; // 100 MB
+    if (size == 0 || size > MAX_ALLOWED_SIZE) {
+		std::array<uint8_t, 16> header{};
+		file.read(reinterpret_cast<char*>(header.data()), header.size());
+
+		std::cout << "[DEBUG] Primeiros 16 bytes do arquivo:\n";
+		for (uint8_t byte : header) {
+			std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)byte << " ";
 		}
+		std::cout << std::dec << "\n";
+
+		float f;
+		std::memcpy(&f, &size, sizeof(float));
+		std::cout << "Interpretado como float: " << f << "\n";
+		
+		std::cerr << "[ERROR] Array size too large or invalid: " << size << "\n";
+		exit(1);
 	}
+
+    array.resize(size);
+    
+    if (array.size() * sizeof(T) < 1024) {
+        if (!file.read(fp::as_writable_bytes(fp::span(array)))) {
+            std::cout << "Failed to read uncompressed data" << std::endl;
+            exit(1);
+        }
+    } else {
+        if (!Decode(fp::as_writable_bytes(fp::span(array)), file)) {
+            std::cout << "Failed to decode compressed data" << std::endl;
+            exit(1);
+        }
+    }
 }
 
 template <class T, class... Args>
@@ -1574,11 +1646,14 @@ int Parse_P3D(std::string filename_input, std::string file_info, int &options) {
 			}
 		} 
 		else {
-			#ifdef SYSTEM_WINDOWS
-				filename_output = CreateOutPath(filename_input);
-				CopyFile(filename_input.c_str(), filename_output.c_str(), 0);
+			filename_output = CreateOutPath(filename_input);
+    
+			try {
+				fs::copy_file(filename_input, filename_output, fs::copy_options::overwrite_existing);
 				global.files_to_skip.push_back(filename_output);
-			#endif
+			} catch (const fs::filesystem_error& e) {
+				std::cout << "Failed to copy file: " << e.what() << std::endl;
+			}
 		}
 	}
 
@@ -1588,241 +1663,199 @@ int Parse_P3D(std::string filename_input, std::string file_info, int &options) {
 	return 0;
 }
 
-#ifdef SYSTEM_WINDOWS
-	std::string Int2Str(int num, bool leading_zero=false)
-	{
-		std::ostringstream text;
-		
-		if (leading_zero  &&  num<10)
-			text << "0";
-		
-		text << num;
-		return text.str();
-	}
+std::string Int2Str(int num, bool leading_zero=false)
+{
+	std::ostringstream text;
+	
+	if (leading_zero  &&  num<10)
+		text << "0";
+	
+	text << num;
+	return text.str();
+}
 
-	std::string FormatFileInfo(FILETIME const& ft, DWORD bytes)
-	{
-		SYSTEMTIME st;
-		FileTimeToSystemTime(&ft, &st);
-		
-		std::string output = 
-			Int2Str(st.wYear) + "." + 
-			Int2Str(st.wMonth,1) + "." + 
-			Int2Str(st.wDay,1) + " " + 
-			Int2Str(st.wHour,1) + ":" + 
-			Int2Str(st.wMinute,1) + ":" + 
-			Int2Str(st.wSecond,1) + " - " +
-			Int2Str(bytes) + " bytes (";
-		
-		double size[]      = {(double)bytes, 0, 0};
-		std::string name[] = {"B", "KB", "MB"};
-		
-		enum SIZE_NAMES {
-			BYTES,
-			KILOBYTES,
-			MEGABYTES
-		};
+std::string FormatFileInfo(const fs::directory_entry& entry) {
+	auto ftime = entry.last_write_time();
+	auto size = entry.file_size();
 	
-		if (size[BYTES] >= 1048576) {
-			size[MEGABYTES]  = size[BYTES] / 1048576;
-			size[MEGABYTES] -= fmod(size[MEGABYTES], 1);
-			size[BYTES]     -= size[MEGABYTES] * 1048576;
-		}
+	// Converter para time_t para formatação
+	auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+		ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
+	std::time_t cftime = std::chrono::system_clock::to_time_t(sctp);
+	std::tm tm = *std::localtime(&cftime);
 	
-		if (size[BYTES] >= 1024) {
-			size[KILOBYTES]  = size[BYTES] / 1024;
-			size[KILOBYTES] -= fmod(size[KILOBYTES], 1);
-			size[BYTES]     -= size[KILOBYTES] * 1024;
-		}
-		
-		int select = 2;
-		
-		while (select >= 0)
-			if (size[select] == 0)
-				select--;
-			else
-				break;
+	char time_buf[100];
+	std::strftime(time_buf, sizeof(time_buf), "%Y.%m.%d %H:%M:%S", &tm);
 	
-		double final_size = select>=0 ? size[select] : 0;
-		
-		if (select > 0)
-			final_size += size[select-1] / 1024;
+	std::string output = 
+		std::string(time_buf) + " - " +
+		std::to_string(size) + " bytes (";
+	
+	double size_val[] = {(double)size, 0, 0};
+	std::string name[] = {"B", "KB", "MB"};
+	
+	if (size_val[0] >= 1048576) {
+		size_val[2] = size_val[0] / 1048576;
+		size_val[0] -= size_val[2] * 1048576;
+	}
+	
+	if (size_val[0] >= 1024) {
+		size_val[1] = size_val[0] / 1024;
+		size_val[0] -= size_val[1] * 1024;
+	}
+	
+	int select = 2;
+	while (select >= 0 && size_val[select] == 0) {
+		select--;
+	}
+	
+	double final_size = select >= 0 ? size_val[select] : 0;
+	
+	if (select > 0) {
+		final_size += size_val[select-1] / 1024;
+	}
+	
+	std::ostringstream tempstr;
+	tempstr << std::fixed << std::setprecision(select==2 ? 2 : 0) << final_size;
+	output += tempstr.str() + " " + name[select] + ")";
+	
+	return output;
+}
+
+int ScanDirectory(const std::string& path, int &options) {
+	try {
+		for (const auto& entry : fs::directory_iterator(path)) {
+			const auto filename = entry.path().filename().string();
 			
-		std::ostringstream tempstr;
-		tempstr << std::fixed << std::setprecision(select==2 ? 2 : 0) << final_size;
-		output += tempstr.str() + " " + name[select] + ")";
-		return output;
-	}
-
-	void FormatError(DWORD error)
-	{
-		if (error == 0) 
-			return;
-
-		LPTSTR errorText = NULL;
-
-		FormatMessage(
-		FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-		NULL,
-		error, 
-		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-		(LPTSTR)&errorText,
-		0,
-		NULL);
-
-		std::cout <<  "   - " << (char*)errorText << std::endl;
-
-		if (errorText != NULL)
-			LocalFree(errorText);
-	}
-	
-	int ScanDirectory(std::string path, int &options)
-	{		
-		WIN32_FIND_DATA fd;
-		std::string wildcard = path + "\\*";
-		HANDLE hFind         = FindFirstFile(wildcard.c_str(), &fd);
-
-		if (hFind == INVALID_HANDLE_VALUE) {
-			FormatError(GetLastError());
-			return 2;
-		}
-		
-		do {
-			std::string file_name = (std::string)fd.cFileName;
-			std::string full_path = path + "\\" + file_name;
-
-			if (file_name == "." || file_name == "..")
+			if (filename == "." || filename == "..") {
 				continue;
-				
-			if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-				if (options & OPTION_RECURSIVE)
-					ScanDirectory(full_path, options);
+			}
+			
+			if (entry.is_directory()) {
+				if (options & OPTION_RECURSIVE) {
+					ScanDirectory(entry.path().string(), options);
+				}
 			} else {
-				size_t dot = file_name.find_last_of('.');
-				
-				if (dot != std::string::npos) {
-					std::string extension = file_name.substr(dot + 1);
-					transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+				if (entry.path().extension() == ".p3d") {
+					bool file_ok = true;
 					
-					if (extension == "p3d") {
-						bool file_ok = true;
-						
-						// Ignore files that were created by this program in this instance
-						for (size_t i=0; i<global.files_to_skip.size() && file_ok; i++)
-							if (full_path == global.files_to_skip[i])
-								file_ok = false;
-						
-						if (file_ok) {
-							global.files_total++;
-							Parse_P3D(full_path, FormatFileInfo(fd.ftLastWriteTime, fd.nFileSizeLow), options);
+					for (const auto& skip_file : global.files_to_skip) {
+						if (entry.path() == skip_file) {
+							file_ok = false;
+							break;
 						}
+					}
+					
+					if (file_ok) {
+						global.files_total++;
+						Parse_P3D(entry.path().string(), 
+									FormatFileInfo(entry), 
+									options);
 					}
 				}
 			}
-		} while (FindNextFile(hFind, &fd) != 0);
-		
-		FindClose(hFind);
+		}
 		return 0;
+	} catch (const std::exception& e) {
+		std::cout << "Error scanning directory: " << e.what() << std::endl;
+		return 2;
 	}
-#endif
+}
 
 int main(int argc, char* argv[]) {
 	int return_value = 0;
-	
-	if (argc < 2) {
-		std::cout << 
-		"odol2mlod v1.01 by Miki and Faguss (ofp-faguss.com)" << std::endl <<
-		"Converts OFP/CWA P3D model from the ODOL format to the MLOD format" << std::endl << std::endl <<
-		"Usage: odol2mlod [options] <file or dir> ..." << std::endl << std::endl <<
-		"Options:" << std::endl << 
-		"\t-m merge vertices (instead of splitting them)" << std::endl << 
-		"\t-M merge vertices only for the functional lods and not the graphical ones" << std::endl << 
-		"\t-u use only user value for vertex lighting (instead of lighting selection)" << std::endl << 
-		"\t-r scan directories recursively" << std::endl <<
-		"\t-i create info file (instead of converting)" << std::endl <<
-		"\t-I create full info file (instead of converting)" << std::endl <<
-		"\t-s create a single info file (instead of one for each model)" << std::endl << 
-		"\t-t create info file only with a texture list" << std::endl <<
-		"\t-T create info file only with a texture list from each LOD" << std::endl <<
-		"\t-l create single info only with a texture list without p3d names" << std::endl;
-		return_value = 1;
-	} else {
-		int options = OPTION_NONE;
-		
-		for (int i=1; i<argc; i++) {
-			if (argv[i][0] == '-') {
-				for (int j=1; argv[i][j]!='\0'; j++) {
-					switch(argv[i][j]) {
-						case 'i' : options |= OPTION_INFO; break;
-						case 'I' : options |= OPTION_INFO | OPTION_INFO_FULL; break;
-						case 'r' : options |= OPTION_RECURSIVE; break;
-						case 's' : options |= OPTION_SINGLELOG | OPTION_TRUNCATE; break;
-						case 'm' : options |= OPTION_MERGE_POINTS; break;
-						case 'M' : options |= OPTION_MERGE_POINTS_SELECTIVE; break;
-						case 'u' : options |= OPTION_ONLY_USER_VALUE; break;
-						case 't' : options |= OPTION_INFO | OPTION_TEXTURE_LIST; break;
-						case 'T' : options |= OPTION_INFO | OPTION_TEXTURE_LIST | OPTION_TEXTURE_LIST_LODS; break;
-						case 'l' : options |= OPTION_SINGLELOG | OPTION_TRUNCATE | OPTION_INFO | OPTION_TEXTURE_LIST | OPTION_TEXTURE_LIST_SINGLE; break;
-					}
-				}
-			} else {
-				#ifdef SYSTEM_WINDOWS
-					WIN32_FILE_ATTRIBUTE_DATA fd;
-					if (GetFileAttributesEx(argv[i], GetFileExInfoStandard, &fd)) {
-						if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-							if (ScanDirectory(argv[i], options)) {
-								if (global.files_ok > 0)
-									return_value = 0;
-								else
-									return_value = 3;
-							} else
-								return_value = 2;
-						} else {
-							std::string file_name = argv[i];
-							size_t dot = file_name.find_last_of('.');
-							
-							if (dot != std::string::npos) {
-								std::string extension = file_name.substr(dot + 1);
-								transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
-								
-								if (extension == "p3d") {
-									if (Parse_P3D(file_name, FormatFileInfo(fd.ftLastWriteTime, fd.nFileSizeLow), options) == 0)
-										return_value = 0;
-									else
-										return_value = 3;
-								}
-							}
-						}
-					} else {
-						FormatError(GetLastError());
-						return_value = 2;
-					}
-				#else
-					Parse_P3D(argv[i], "", options);
-				#endif
-			}
-		}
-		
-		if (options & OPTION_TEXTURE_LIST_SINGLE) {
-			std::fstream out;
-			out.open("odol2mlod_texture_list.txt", std::ios::out | std::ios::trunc);
-			
-			if (!out.is_open()) {
-				std::cout << "Failed to open odol2mlod.txt - error " << errno << ": " << strerror(errno) << std::endl;
-				return 1;
-			}
-			
-			for (size_t i=0; i<global.texture_list.size(); i++) {
-				out << global.texture_list[i] << std::endl;
-			}
-			
-			out.close();
-		}
-	}
-	
+    
+    if (argc < 2) {
+        std::cout << 
+        "odol2mlod v1.01 by Miki and Faguss (ofp-faguss.com)" << std::endl <<
+        "Converts OFP/CWA P3D model from the ODOL format to the MLOD format" << std::endl << std::endl <<
+        "Usage: odol2mlod [options] <file or dir> ..." << std::endl << std::endl <<
+        "Options:" << std::endl << 
+        "\t-m merge vertices (instead of splitting them)" << std::endl << 
+        "\t-M merge vertices only for the functional lods and not the graphical ones" << std::endl << 
+        "\t-u use only user value for vertex lighting (instead of lighting selection)" << std::endl << 
+        "\t-r scan directories recursively" << std::endl <<
+        "\t-i create info file (instead of converting)" << std::endl <<
+        "\t-I create full info file (instead of converting)" << std::endl <<
+        "\t-s create a single info file (instead of one for each model)" << std::endl << 
+        "\t-t create info file only with a texture list" << std::endl <<
+        "\t-T create info file only with a texture list from each LOD" << std::endl <<
+        "\t-l create single info only with a texture list without p3d names" << std::endl;
+        return_value = 1;
+    } else {
+        int options = OPTION_NONE;
+        
+        for (int i=1; i<argc; i++) {
+            if (argv[i][0] == '-') {
+                for (int j=1; argv[i][j]!='\0'; j++) {
+                    switch(argv[i][j]) {
+                        case 'i' : options |= OPTION_INFO; break;
+                        case 'I' : options |= OPTION_INFO | OPTION_INFO_FULL; break;
+                        case 'r' : options |= OPTION_RECURSIVE; break;
+                        case 's' : options |= OPTION_SINGLELOG | OPTION_TRUNCATE; break;
+                        case 'm' : options |= OPTION_MERGE_POINTS; break;
+                        case 'M' : options |= OPTION_MERGE_POINTS_SELECTIVE; break;
+                        case 'u' : options |= OPTION_ONLY_USER_VALUE; break;
+                        case 't' : options |= OPTION_INFO | OPTION_TEXTURE_LIST; break;
+                        case 'T' : options |= OPTION_INFO | OPTION_TEXTURE_LIST | OPTION_TEXTURE_LIST_LODS; break;
+                        case 'l' : options |= OPTION_SINGLELOG | OPTION_TRUNCATE | OPTION_INFO | OPTION_TEXTURE_LIST | OPTION_TEXTURE_LIST_SINGLE; break;
+                    }
+                }
+            } else {
+                struct stat info;
+                if (stat(argv[i], &info) != 0) {
+                    std::cout << "Cannot access " << argv[i] << std::endl;
+                    return_value = 2;
+                } else if (S_ISDIR(info.st_mode)) {
+                    if (ScanDirectory(argv[i], options)) {
+                        if (global.files_ok > 0)
+                            return_value = 0;
+                        else
+                            return_value = 3;
+                    } else {
+                        return_value = 2;
+                    }
+                } else {
+                    std::string file_name = argv[i];
+                    size_t dot = file_name.find_last_of('.');
+                    
+                    if (dot != std::string::npos) {
+                        std::string ext = file_name.substr(dot + 1);
+                        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                        
+                        if (ext == "p3d") {
+                            fs::directory_entry entry(file_name);
+                            if (Parse_P3D(file_name, FormatFileInfo(entry), options) == 0) {
+                                return_value = 0;
+                            } else {
+                                return_value = 3;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        if (options & OPTION_TEXTURE_LIST_SINGLE) {
+            std::fstream out;
+            out.open("odol2mlod_texture_list.txt", std::ios::out | std::ios::trunc);
+            
+            if (!out.is_open()) {
+                std::cout << "Failed to open odol2mlod.txt - error " << errno << ": " << strerror(errno) << std::endl;
+                return 1;
+            }
+            
+            for (size_t i=0; i<global.texture_list.size(); i++) {
+                out << global.texture_list[i] << std::endl;
+            }
+            
+            out.close();
+        }
+    }
+    
 
-	if (global.files_total > 1)
-		std::cout << "Files ok: " << global.files_ok << "/" << global.files_total << std::endl;
-					
-	return return_value;
+    if (global.files_total > 1)
+        std::cout << "Files ok: " << global.files_ok << "/" << global.files_total << std::endl;
+                        
+    return return_value;
 }
